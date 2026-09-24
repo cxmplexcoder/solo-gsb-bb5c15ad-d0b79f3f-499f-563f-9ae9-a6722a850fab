@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**提交预演**（`POST /ingest/preview` 与正式提交同口径，在同一快照上按请求顺序推进去重/水位线/封存，逐事件给出 accepted/duplicate/late 与触及窗口预演聚合，事务一律回滚不留写入），提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）、**设备级高值告警**（触发/恢复双阈值滞回状态机，事件写入驱动状态转换，规则与状态持久化，批次重试不重复产生状态变化）、**设备告警周期查询**（按转换流水自增顺序配对 entered/cleared 成周期，以流水处理时刻为起止，裁剪到指定 UTC 区间给出各周期秒数与总告警秒数，未解除周期计至 end 与查询时刻较早者，纯只读）、**设备缺报区间查询**（按窗口空隙计算连续缺报段，水位线未越过封存条件的窗口不报缺，迟到填空后自动缩短/拆分，纯只读）、**设备计划停报报备**（按设备登记/列出半开 `[start,end)` 停报区间，起止须按设备窗口大小对齐且 `end>start`，持久化于 SQLite；缺报查询可用 `exclude_planned=true` 先按原规则求缺报再合并扣除重叠计划，端点触碰不算重叠、重叠计划不重复扣除，区间运算不逐窗遍历）与**设备每日同窗基线偏移查询**（按 UTC 每天同一窗位回看已封存窗口，以窗口均值的中位数/MAD 计算目标窗口偏移分数，缺失或未封存样本不以临近窗口代替，样本不足明确返回，迟到修正后再次查询反映最新聚合，纯只读）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**提交预演**（`POST /ingest/preview` 与正式提交同口径，在同一快照上按请求顺序推进去重/水位线/封存，逐事件给出 accepted/duplicate/late 与触及窗口预演聚合，事务一律回滚不留写入），提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）、**跨设备窗口检索**（按时间范围、状态与设备标签精确筛选，绑定筛选条件的稳定游标分页）、**设备级高值告警**（触发/恢复双阈值滞回状态机，事件写入驱动状态转换，规则与状态持久化，批次重试不重复产生状态变化）、**设备告警周期查询**（按转换流水自增顺序配对 entered/cleared 成周期，以流水处理时刻为起止，裁剪到指定 UTC 区间给出各周期秒数与总告警秒数，未解除周期计至 end 与查询时刻较早者，纯只读）、**设备缺报区间查询**（按窗口空隙计算连续缺报段，水位线未越过封存条件的窗口不报缺，迟到填空后自动缩短/拆分，纯只读）、**设备计划停报报备**（按设备登记/列出半开 `[start,end)` 停报区间，起止须按设备窗口大小对齐且 `end>start`，持久化于 SQLite；缺报查询可用 `exclude_planned=true` 先按原规则求缺报再合并扣除重叠计划，端点触碰不算重叠、重叠计划不重复扣除，区间运算不逐窗遍历）与**设备每日同窗基线偏移查询**（按 UTC 每天同一窗位回看已封存窗口，以窗口均值的中位数/MAD 计算目标窗口偏移分数，缺失或未封存样本不以临近窗口代替，样本不足明确返回，迟到修正后再次查询反映最新聚合，纯只读），并提供**设备持久化聚合完整性核查**（`GET /devices/{id}/integrity`：指定对齐窗口范围内，单次只读事务内从原始事件重算 count/sum/min/max/late_event_count 并与 windows 表逐窗对账，缺少窗口行与无事件窗口行同样列为差异，浮点聚合按 1e-9 容差比较，差异项按 window_start 升序给出期望值与实际值，不改动水位线/修正/组汇总）。
 
 ## 核心语义
 
@@ -843,6 +843,41 @@ curl 'http://localhost:8000/devices/sensor-001/alert-episodes?start=2026-09-23T0
 - 尚未解除的周期 `cleared_at=null`，只计至 `end` 与查询时刻的较早者（查询未来区间时不会把当前仍在告警的周期计到 `now` 之后）。
 - `start`/`end` 必填且 `end > start`，否则 `422`；设备或告警规则不存在返回 `404`；无相交周期返回 `{"episodes": [], "total_seconds": 0}`。
 
+### 23. 持久化聚合完整性核查（对账诊断）
+
+供运维核查指定窗口范围内 **windows 表持久化聚合与原始事件是否一致**：在单次 SQLite 只读事务内按事件时间把原始事件归窗（与写入路径同一归窗口径），重算 `count`/`sum`/`min`/`max`/`late_event_count`，并与 windows 表逐窗对账：
+
+```bash
+curl 'http://localhost:8000/devices/sensor-001/integrity?start=2026-09-22T10:00:00Z&end=2026-09-22T10:10:00Z'
+```
+
+```json
+{
+  "device_id": "sensor-001",
+  "start": "2026-09-22T10:00:00Z",
+  "end": "2026-09-22T10:10:00Z",
+  "window_size_seconds": 60,
+  "windows_checked": 10,
+  "discrepancy_count": 1,
+  "discrepancies": [
+    {
+      "window_start": "2026-09-22T10:00:00Z",
+      "window_end": "2026-09-22T10:01:00Z",
+      "kind": "aggregate_mismatch",
+      "expected": {"count": 3, "sum": 64.4, "min": 20.9, "max": 22.0, "late_event_count": 1},
+      "actual": {"count": 3, "sum": 64.3, "min": 20.9, "max": 22.0, "late_event_count": 1},
+      "mismatched_fields": ["sum"]
+    }
+  ]
+}
+```
+
+- **对账口径**：`expected` 为原始事件重算结果，`actual` 为 windows 表记录；差异项按 `window_start` 升序，`mismatched_fields` 列出不一致的聚合字段；`discrepancy_count=0` 即范围内账实相符。
+- **结构性差异**：有事件但缺少窗口行时 `kind=missing_window_row`、`actual=null`；存在无事件的窗口行时 `kind=unexpected_window_row`（期望为全零聚合，即使行内计数全为 0 也列为差异）。
+- **浮点容差**：`sum`/`min`/`max` 按相对或绝对误差 `1e-9` 判定一致，规避累加顺序造成的尾差误报；`count`/`late_event_count` 按整数精确比较。
+- **参数约束**：`start`/`end` 必填，取半开区间 `[start, end)`，必须**对齐设备窗口大小**且 `end > start`，单次最多覆盖 **1000** 个窗口；违反任一约束返回 `422`，设备不存在返回 `404`。
+- **纯只读**：核查在单次只读事务内完成，不改动水位线、窗口聚合、修正记录与组汇总。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -863,6 +898,7 @@ curl 'http://localhost:8000/devices/sensor-001/alert-episodes?start=2026-09-23T0
 | `POST` | `/devices/{device_id}/planned-outages` | 登记计划停报（已批准停机）半开区间 `[start,end)`（起止须对齐设备窗口大小且 end>start，否则 422；设备不存在 404；可选 reason；允许重叠登记；201，持久化于 SQLite） |
 | `GET` | `/devices/{device_id}/planned-outages` | 列出设备全部计划停报时段（按 start 升序；设备不存在 404） |
 | `GET` | `/devices/{device_id}/daily-baseline?window_start=&days=&threshold=` | 每日同窗基线偏移查询（只读；按 UTC 逐日同格回看已封存窗口，中位数/MAD 打分，缺失/未封存跳过不替代，有效样本 <3 返回 insufficient_samples，MAD=0 同值记 0/异值 score=null 且越界；days 3..30、threshold>0、窗口秒数不整除一天为 422，目标窗口不存在 404、未封存 409） |
+| `GET` | `/devices/{device_id}/integrity?start=&end=` | 持久化聚合完整性核查（只读；单次只读事务内按事件时间归窗重算 count/sum/min/max/late_event_count 并与 windows 表逐窗对账，缺少窗口行/无事件窗口行同样列为差异，浮点按 1e-9 容差比较，差异按 window_start 升序给出期望值/实际值；start/end 必填且对齐窗口大小、end>start、最多 1000 窗，非法 422，设备不存在 404） |
 | `PUT` | `/devices/{device_id}/alert-rule` | 设置/替换高值告警双阈值（trigger 必须严格高于 recovery，均为有限数；非法 400 且旧规则保留，设备不存在 404） |
 | `GET` | `/devices/{device_id}/alert` | 查询当前告警状态与生效规则（无规则 404；状态持久化、重启不丢） |
 | `GET` | `/devices/{device_id}/alert-episodes?start=&end=` | 告警周期与总告警秒数查询（只读；按转换流水自增顺序配对 entered/cleared，以流水 created_at 为起止，裁剪到 [start,end)，未解除周期计至 end 与查询时刻较早者；start/end 必填且 end>start 否则 422，设备或规则不存在 404，无相交周期返回空明细与 0） |
@@ -878,7 +914,7 @@ curl 'http://localhost:8000/devices/sensor-001/alert-episodes?start=2026-09-23T0
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合、提交预演（/ingest 与 /ingest/preview 共用同一批次处理逻辑、预演事务回滚）、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、告警周期查询（流水配对/区间裁剪/总秒数）、设备缺报区间查询（exclude_planned 合并扣除计划停报、区间运算不逐窗遍历）、设备计划停报登记/列出、每日同窗基线偏移查询逻辑
+  main.py        # FastAPI 应用、遥测聚合、提交预演（/ingest 与 /ingest/preview 共用同一批次处理逻辑、预演事务回滚）、设备标签（版本化/乐观并发）、设备组同步窗口汇总与修订审计快照、跨设备窗口检索（稳定游标分页）、设备级高值告警（双阈值滞回状态机）、告警周期查询（流水配对/区间裁剪/总秒数）、设备缺报区间查询（exclude_planned 合并扣除计划停报、区间运算不逐窗遍历）、设备计划停报登记/列出、每日同窗基线偏移查询、持久化聚合完整性核查（原始事件重算与 windows 表逐窗对账）逻辑
   db.py          # SQLite 连接、建表（含标签表、append-only 审计表/触发器、告警规则/状态/转换流水表、计划停报表）、旧库迁移与事务会话（提交 / 立即写锁 / 预演回滚）
 tests/
   test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
@@ -893,6 +929,7 @@ tests/
   test_missing_windows.py # 设备缺报区间查询测试（缺报段计算/封存条件裁剪/半开边界/迟到填空拆分/422/404/只读）
   test_planned_outages.py # 设备计划停报测试（登记对齐/end>start 校验/404/reason 规范化/重叠登记/重启持久化/列出排序与设备隔离/exclude_planned 扣除：整段覆盖/拆分/触碰不重叠/范围外不参与/重叠不双扣/未封存不报/自定义窗口/只读）
   test_daily_baseline.py # 每日同窗基线偏移查询测试（UTC 同格回看/仅取已封存样本/不替代缺失/中位数/MAD 打分/样本不足/MAD=0 退化/迟到修正再查/整除校验/参数校验/404/409/只读）
+  test_integrity.py   # 持久化聚合完整性核查测试（健康无差异/缺少窗口行/无事件窗口行/五项聚合不一致/1e-9 相对与绝对容差/差异升序/范围外不参与/1000 窗口上限/422/404/只读）
 Dockerfile
 docker-compose.yml
 requirements.txt

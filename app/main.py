@@ -126,6 +126,16 @@
 - MAD 为 0 时：目标均值等于中位数（同值偏移）记 score=0、breached=false；异值偏移除以 0 无定义，
   score 返回 null 并标记 breached=true。
 - 迟到修正原位更新窗口聚合，再次查询立即反映最新的 count/sum/avg；接口纯只读。
+
+设备持久化聚合完整性核查（只读）：
+- GET /devices/{device_id}/integrity?start=&end= 供运维核查指定窗口范围内的持久化聚合：
+  在单次 SQLite 只读事务内按事件时间把原始事件归窗（与写入路径同一归窗口径），
+  重算 count/sum/min/max/late_event_count，与 windows 表逐窗对账；
+  有事件但缺少窗口行、或存在无事件的窗口行，同样列为差异。
+- 差异项按 window_start 升序返回，每项给出期望值（原始事件重算）与实际值（windows 表，
+  缺行为 null）及不一致字段；浮点聚合按相对或绝对误差 1e-9 判定一致。
+- 范围边界必须对齐设备窗口大小且单次最多覆盖 1000 个窗口；设备不存在返回 404，
+  范围非法（倒置、未对齐、超上限）返回 422；核查纯只读，不改动水位线、修正记录与组汇总。
 """
 
 from __future__ import annotations
@@ -169,7 +179,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.11.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.12.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -179,6 +189,9 @@ SECONDS_PER_DAY = 86400
 MIN_BASELINE_DAYS = 3
 MAX_BASELINE_DAYS = 30
 MIN_BASELINE_SAMPLES = 3
+# 持久化聚合完整性核查：单次核查最多覆盖的窗口数；浮点聚合对账容差（相对或绝对误差）
+INTEGRITY_MAX_WINDOWS = 1000
+INTEGRITY_FLOAT_TOLERANCE = 1e-9
 
 
 # ---------- Pydantic 模型 ----------
@@ -358,6 +371,37 @@ class DailyBaselineOut(BaseModel):
     threshold: float
     # 越界判定；样本不足（无法判定）时为 null
     breached: Optional[bool] = None
+
+
+class IntegrityAggregateOut(BaseModel):
+    # 一个窗口的五项对账聚合：count/sum/min/max/late_event_count
+    count: int
+    sum: float
+    min: Optional[float] = None
+    max: Optional[float] = None
+    late_event_count: int
+
+
+class IntegrityDiscrepancyOut(BaseModel):
+    # 一处窗口对账差异：期望值为原始事件重算结果，实际值为 windows 表记录（缺行时为 null）
+    window_start: datetime
+    window_end: datetime
+    # missing_window_row=有事件但缺少窗口行；unexpected_window_row=存在无事件的窗口行；
+    # aggregate_mismatch=两侧都有记录但聚合不一致
+    kind: Literal["missing_window_row", "unexpected_window_row", "aggregate_mismatch"]
+    expected: IntegrityAggregateOut
+    actual: Optional[IntegrityAggregateOut] = None
+    mismatched_fields: list[str]
+
+
+class IntegrityReportOut(BaseModel):
+    device_id: str
+    start: datetime
+    end: datetime
+    window_size_seconds: int
+    windows_checked: int
+    discrepancy_count: int
+    discrepancies: list[IntegrityDiscrepancyOut]  # 按 window_start 升序
 
 
 class GroupCreate(BaseModel):
@@ -2069,6 +2113,158 @@ def get_device_daily_baseline(
             result.score = deviation / mad
             result.breached = result.score > threshold
         return result
+
+
+# ---------- 设备持久化聚合完整性核查接口 ----------
+
+def _integrity_float_match(a: Optional[float], b: Optional[float]) -> bool:
+    """浮点聚合对账：相对或绝对误差 1e-9 内视为一致；None 仅与 None 一致。"""
+    if a is None or b is None:
+        return a is None and b is None
+    return math.isclose(
+        a, b, rel_tol=INTEGRITY_FLOAT_TOLERANCE, abs_tol=INTEGRITY_FLOAT_TOLERANCE
+    )
+
+
+def _integrity_mismatched_fields(
+    expected: IntegrityAggregateOut, actual: Optional[IntegrityAggregateOut]
+) -> list[str]:
+    """逐项对账五项聚合，返回不一致字段名；actual 为 None（缺少窗口行）时全部字段不一致。"""
+    if actual is None:
+        return ["count", "sum", "min", "max", "late_event_count"]
+    mismatched: list[str] = []
+    if expected.count != actual.count:
+        mismatched.append("count")
+    if not _integrity_float_match(expected.sum, actual.sum):
+        mismatched.append("sum")
+    if not _integrity_float_match(expected.min, actual.min):
+        mismatched.append("min")
+    if not _integrity_float_match(expected.max, actual.max):
+        mismatched.append("max")
+    if expected.late_event_count != actual.late_event_count:
+        mismatched.append("late_event_count")
+    return mismatched
+
+
+@app.get("/devices/{device_id}/integrity", response_model=IntegrityReportOut)
+def check_device_integrity(
+    device_id: str,
+    start: datetime = Query(..., description="核查范围下界（含），必须对齐设备窗口大小，ISO 8601"),
+    end: datetime = Query(..., description="核查范围上界（不含），必须对齐设备窗口大小，ISO 8601"),
+) -> IntegrityReportOut:
+    """核查指定窗口范围内持久化聚合与原始事件的一致性（只读）。
+
+    在单次 SQLite 只读事务内按事件时间把原始事件归窗（分桶公式与 ingest 的
+    window_floor 一致），重算 count/sum/min/max/late_event_count，并与 windows 表
+    逐窗对账：
+    - 有事件但缺少窗口行（missing_window_row）、或存在无事件的窗口行
+      （unexpected_window_row）都列为差异；
+    - 两侧都有记录的窗口逐项比较五项聚合，浮点聚合按相对或绝对误差 1e-9 判定一致。
+    差异项按 window_start 升序返回，每项给出期望值、实际值（缺行为 null）与不一致字段。
+    start/end 必须对齐设备窗口大小且 end > start，单次最多覆盖 1000 个窗口；
+    设备不存在返回 404，范围非法返回 422。核查纯只读，不改动水位线、修正记录与组汇总。
+    """
+    with db.session() as conn:
+        # 显式只读事务：以下所有查询落在同一快照上（WAL 下并发写入不影响本快照），
+        # 会话结束提交的是纯读事务，不改动任何数据
+        conn.execute("BEGIN")
+        dev = require_device(conn, device_id)
+        size = dev["window_size_seconds"]
+
+        start_ts = to_epoch(start)
+        end_ts = to_epoch(end)
+        if end_ts <= start_ts:
+            raise HTTPException(status_code=422, detail="end must be strictly greater than start")
+        if start_ts % size != 0 or end_ts % size != 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"start and end must be aligned to the device window size ({size}s)",
+            )
+        window_count = int(round((end_ts - start_ts) / size))
+        if window_count > INTEGRITY_MAX_WINDOWS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"range covers {window_count} windows, exceeding the maximum of"
+                    f" {INTEGRITY_MAX_WINDOWS}"
+                ),
+            )
+
+        # 从原始事件重算：FLOOR(event_time / size) 与 ingest 的 window_floor 同为
+        # IEEE 754 双精度除法后向下取整，归窗口径完全一致
+        event_rows = conn.execute(
+            "SELECT CAST(FLOOR(event_time / ?) AS INTEGER) AS bucket,"
+            " COUNT(*) AS count, SUM(value) AS sum, MIN(value) AS min, MAX(value) AS max,"
+            " SUM(CASE WHEN status = 'late' THEN 1 ELSE 0 END) AS late_event_count"
+            " FROM events"
+            " WHERE device_id = ? AND event_time >= ? AND event_time < ?"
+            " GROUP BY bucket",
+            (size, device_id, start_ts, end_ts),
+        ).fetchall()
+        window_rows = conn.execute(
+            "SELECT window_start, count, sum, min, max, late_event_count"
+            " FROM windows WHERE device_id = ? AND window_start >= ? AND window_start < ?",
+            (device_id, start_ts, end_ts),
+        ).fetchall()
+
+    expected_by_start: dict[float, IntegrityAggregateOut] = {
+        float(r["bucket"] * size): IntegrityAggregateOut(
+            count=r["count"],
+            sum=r["sum"],
+            min=r["min"],
+            max=r["max"],
+            late_event_count=r["late_event_count"],
+        )
+        for r in event_rows
+    }
+    actual_by_start: dict[float, IntegrityAggregateOut] = {
+        r["window_start"]: IntegrityAggregateOut(
+            count=r["count"],
+            sum=r["sum"],
+            min=r["min"],
+            max=r["max"],
+            late_event_count=r["late_event_count"],
+        )
+        for r in window_rows
+    }
+
+    discrepancies: list[IntegrityDiscrepancyOut] = []
+    for w_start in sorted(set(expected_by_start) | set(actual_by_start)):
+        expected = expected_by_start.get(w_start)
+        actual = actual_by_start.get(w_start)
+        if expected is None:
+            # 存在无事件的窗口行：期望为全零聚合（无事件时 min/max 为 null）
+            expected = IntegrityAggregateOut(
+                count=0, sum=0.0, min=None, max=None, late_event_count=0
+            )
+            kind = "unexpected_window_row"
+        elif actual is None:
+            kind = "missing_window_row"
+        else:
+            kind = "aggregate_mismatch"
+        mismatched = _integrity_mismatched_fields(expected, actual)
+        if kind == "aggregate_mismatch" and not mismatched:
+            continue
+        discrepancies.append(
+            IntegrityDiscrepancyOut(
+                window_start=to_iso(w_start),
+                window_end=to_iso(w_start + size),
+                kind=kind,
+                expected=expected,
+                actual=actual,
+                mismatched_fields=mismatched,
+            )
+        )
+
+    return IntegrityReportOut(
+        device_id=device_id,
+        start=start,
+        end=end,
+        window_size_seconds=size,
+        windows_checked=window_count,
+        discrepancy_count=len(discrepancies),
+        discrepancies=discrepancies,
+    )
 
 
 # ---------- 设备级高值告警接口 ----------
